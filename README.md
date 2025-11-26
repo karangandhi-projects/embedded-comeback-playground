@@ -247,4 +247,4 @@ UART Settings:
 
 # 📄 License
 
-MIT License (or specify whichever you want).
+MIT License.
