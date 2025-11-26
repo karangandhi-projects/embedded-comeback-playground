@@ -44,6 +44,7 @@
  *   v1.6.0  - Added multi-word CLI (help, status, sensor read, log start/stop)
  *   v1.7.0  - Added log queue to decouple logging from CLI input
  *   v1.8.0  - Added 'clear' / 'cls' command to clear terminal
+ *   v1.8.1  - Disable SensorTask logging noise
  *
  * Upcoming:
  *   v1.9.0  - Real sensor over I2C (BME280)
@@ -74,9 +75,9 @@ typedef struct
 /* Firmware version macros */
 #define FW_VERSION_MAJOR   1
 #define FW_VERSION_MINOR   8
-#define FW_VERSION_PATCH   0
+#define FW_VERSION_PATCH   1
 
-#define FW_VERSION_STRING  "v1.8.0"
+#define FW_VERSION_STRING  "v1.8.1"
 #define FW_BUILD_DATE      __DATE__
 #define FW_BUILD_TIME      __TIME__
 
@@ -713,7 +714,11 @@ void LEDTask(void *argument)
 
 /**
   * @brief Sensor task
-  * @note  Periodically reads the virtual sensor and enqueues log messages.
+  * @note  Periodically reads the virtual sensor.
+  *        Logging is now handled only by:
+  *          - TIM2 ISR (when logging_enabled = 1)
+  *          - On-demand CLI command: "sensor read"
+  *        This keeps the CLI output clean (no background RTOS LOG spam).
   */
 void SensorTask(void *argument)
 {
@@ -724,14 +729,15 @@ void SensorTask(void *argument)
   for (;;)
   {
     float temp = sensor_read_celsius();
+    (void)temp;          /* Value can be used internally later if needed */
 
-    LogMessage_t logMsg;
-    snprintf(logMsg.text, sizeof(logMsg.text), "RTOS LOG: %.1f C\r\n", temp);
+    //LogMessage_t logMsg;
+    //snprintf(logMsg.text, sizeof(logMsg.text), "RTOS LOG: %.1f C\r\n", temp);
 
     /* Non-blocking log enqueue; if queue is full, drop the log */
-    (void)osMessageQueuePut(logQueueHandle, &logMsg, 0, 0);
+    //(void)osMessageQueuePut(logQueueHandle, &logMsg, 0, 0);
 
-    osDelay(1000);                          /* 1 s */
+    osDelay(1000);       /* 1 s */
   }
 }
 
