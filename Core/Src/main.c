@@ -25,14 +25,64 @@
 #include <string.h>
 #include <stdio.h>
 #include "sensor.h"
+
+/* ---------------------------------------------------------------------------
+ * Firmware Version Information
+ * ---------------------------------------------------------------------------
+ *
+ * Firmware Name : STM32 FreeRTOS CLI Playground
+ * Board         : NUCLEO-F446RE
+ * MCU           : STM32F446RE (Cortex-M4F)
+ *
+ * Version History:
+ *   v1.0.0  - Basic LED timer using TIM2 (initial bring-up)
+ *   v1.1.0  - Added UART2 support + interrupt-driven RX
+ *   v1.2.0  - Added simple single-character CLI
+ *   v1.3.0  - Added virtual temperature sensor module
+ *   v1.4.0  - Added FreeRTOS tasks (LEDTask, SensorTask, CLITask)
+ *   v1.5.0  - Added UART mutex for thread-safe logging
+ *   v1.6.0  - Added multi-word CLI (help, status, sensor read, log start/stop)
+ *   v1.7.0  - Added log queue to decouple logging from CLI input
+ *   v1.8.0  - Added 'clear' / 'cls' command to clear terminal
+ *
+ * Upcoming:
+ *   v1.9.0  - Real sensor over I2C (BME280)
+ *   v2.0.0  - UART DMA circular buffer (idle line interrupt) + log levels
+ *
+ * Build Timestamp:
+ *   __DATE__  - compile date
+ *   __TIME__  - compile time
+ *
+ * ---------------------------------------------------------------------------
+ */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+
+/* Log message type: fixed-size string for log lines */
+typedef struct
+{
+  char text[64];
+} LogMessage_t;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+
+/* Firmware version macros */
+#define FW_VERSION_MAJOR   1
+#define FW_VERSION_MINOR   8
+#define FW_VERSION_PATCH   0
+
+#define FW_VERSION_STRING  "v1.8.0"
+#define FW_BUILD_DATE      __DATE__
+#define FW_BUILD_TIME      __TIME__
+
+/* ANSI escape sequence to clear terminal screen and move cursor to home */
+#define ANSI_CLEAR_SCREEN  "\033[2J\033[H"
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -51,7 +101,7 @@ UART_HandleTypeDef huart2;
 /* Single-byte RX buffer for interrupt-driven UART */
 uint8_t rx_byte;
 
-/* Logging flag (controlled by CLI 'l' / 'x' commands, read in timer callback) */
+/* Logging flag (controlled by CLI 'log start' / 'log stop' or 'l'/'x') */
 volatile uint8_t logging_enabled = 0;
 
 /* Task handles */
@@ -61,6 +111,9 @@ osThreadId_t cliTaskHandle;
 
 /* CLI input queue (ISR → CLI task) */
 osMessageQueueId_t cliQueueHandle;
+
+/* Log queue: SensorTask + timer ISR → CLITask */
+osMessageQueueId_t logQueueHandle;
 
 /* UART mutex for thread-safe printing from multiple tasks */
 osMutexId_t uartMutexHandle;
@@ -89,10 +142,15 @@ const osMessageQueueAttr_t cliQueue_attributes = {
   .name = "cliQueue"
 };
 
+const osMessageQueueAttr_t logQueue_attributes = {
+  .name = "logQueue"
+};
+
 /* UART mutex attributes */
 const osMutexAttr_t uartMutex_attributes = {
   .name = "uartMutex"
 };
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -117,14 +175,23 @@ void uart_print(const char *msg);
 void uart_write_char(uint8_t c);
 
 /**
- * @brief Handle one CLI command character.
+ * @brief Legacy single-character CLI handler.
+ * @note  Kept for reference; not used by CLITask anymore. New code uses
+ *        handle_command_line() with multi-word commands.
  */
 void handle_command(uint8_t c);
+
+/**
+ * @brief Multi-word CLI command handler.
+ * @param line Null-terminated input line, e.g. "sensor read", "log start".
+ */
+void handle_command_line(const char *line);
 
 /* RTOS task entry functions */
 void LEDTask(void *argument);
 void SensorTask(void *argument);
 void CLITask(void *argument);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -160,7 +227,7 @@ int main(void)
   MX_TIM2_Init();
 
   /* USER CODE BEGIN 2 */
-  /* Start TIM2 base with interrupt (used for optional logging) */
+  /* Start TIM2 base with interrupt (used for optional periodic logging) */
   HAL_TIM_Base_Start_IT(&htim2);
   /* USER CODE END 2 */
 
@@ -183,6 +250,9 @@ int main(void)
   /* USER CODE BEGIN RTOS_QUEUES */
   /* Create CLI message queue (ISR → CLI task) */
   cliQueueHandle = osMessageQueueNew(32, sizeof(uint8_t), &cliQueue_attributes);
+
+  /* Create log message queue (SensorTask / timer → CLITask) */
+  logQueueHandle = osMessageQueueNew(16, sizeof(LogMessage_t), &logQueue_attributes);
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
@@ -371,8 +441,8 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 /**
-  * @brief Period elapsed callback in non-blocking mode
-  * @note  Called from TIM2 interrupt. Here we only handle optional
+  * @brief Period elapsed callback in non-blocking mode.
+  * @note  Called from TIM2 interrupt. Here we only queue optional
   *        periodic logging (if logging_enabled == 1). LED blinking
   *        is handled in LEDTask instead.
   */
@@ -383,9 +453,12 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     if (logging_enabled)
     {
       float temp = sensor_read_celsius();
-      char msg[64];
-      snprintf(msg, sizeof(msg), "LOG: %.1f C\r\n", temp);
-      uart_print(msg);
+
+      LogMessage_t logMsg;
+      snprintf(logMsg.text, sizeof(logMsg.text), "LOG: %.1f C\r\n", temp);
+
+      /* Best-effort enqueue: do NOT block in ISR */
+      (void)osMessageQueuePut(logQueueHandle, &logMsg, 0, 0);
     }
   }
 }
@@ -443,7 +516,8 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 }
 
 /**
-  * @brief Handle one CLI command character.
+  * @brief Legacy single-character handler (no longer used by CLITask).
+  * @note  Left here for reference. New CLI uses handle_command_line().
   */
 void handle_command(uint8_t c)
 {
@@ -488,6 +562,141 @@ void handle_command(uint8_t c)
 }
 
 /**
+  * @brief Multi-word CLI parser.
+  * @note  Supports both long forms and legacy short forms:
+  *        - "help" or "h"
+  *        - "status" or "s"
+  *        - "version"
+  *        - "clear" or "cls"
+  *        - "led toggle" or "t"
+  *        - "sensor read" or "r"
+  *        - "log start" or "l"
+  *        - "log stop" or "x"
+  */
+void handle_command_line(const char *line)
+{
+  /* Simple tokenizer: extract up to 3 words */
+  char cmd[16]  = {0};
+  char arg1[16] = {0};
+  char arg2[16] = {0};
+
+  /* Parse: cmd [arg1] [arg2] */
+  (void)sscanf(line, "%15s %15s %15s", cmd, arg1, arg2);
+
+  /* help / h */
+  if (strcmp(cmd, "h") == 0 || strcmp(cmd, "help") == 0)
+  {
+    uart_print(
+      "\r\nCommands:\r\n"
+      "  help                - show this help\r\n"
+      "  status              - show system status\r\n"
+      "  version             - show firmware version\r\n"
+      "  clear / cls         - clear terminal screen\r\n"
+      "  led toggle          - toggle LED\r\n"
+      "  sensor read         - read sensor once\r\n"
+      "  log start           - enable timer-based logging\r\n"
+      "  log stop            - disable timer-based logging\r\n"
+    );
+    return;
+  }
+
+  /* status / s */
+  if (strcmp(cmd, "s") == 0 || strcmp(cmd, "status") == 0)
+  {
+    uart_print("\r\nStatus: OK, timer+uart+RTOS running\r\n");
+    return;
+  }
+
+  /* version */
+  if (strcmp(cmd, "version") == 0)
+  {
+    char buf[128];
+    snprintf(buf, sizeof(buf),
+             "\r\nFirmware %s\r\nBuilt on %s at %s\r\n",
+             FW_VERSION_STRING, FW_BUILD_DATE, FW_BUILD_TIME);
+    uart_print(buf);
+    return;
+  }
+
+  /* clear / cls */
+  if (strcmp(cmd, "clear") == 0 || strcmp(cmd, "cls") == 0)
+  {
+    uart_print(ANSI_CLEAR_SCREEN);
+    uart_print("> ");
+    return;
+  }
+
+  /* t (short form LED toggle) */
+  if (strcmp(cmd, "t") == 0)
+  {
+    HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
+    uart_print("\r\nLED toggled\r\n");
+    return;
+  }
+
+  /* led toggle */
+  if (strcmp(cmd, "led") == 0)
+  {
+    if (strcmp(arg1, "toggle") == 0)
+    {
+      HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
+      uart_print("\r\nLED toggled\r\n");
+    }
+    else
+    {
+      uart_print("\r\nUsage: led toggle\r\n");
+    }
+    return;
+  }
+
+  /* r (short form sensor read) */
+  if (strcmp(cmd, "r") == 0)
+  {
+    float temp_c = sensor_read_celsius();
+    char msg[64];
+    snprintf(msg, sizeof(msg), "\r\nSensor value: %.1f C\r\n", temp_c);
+    uart_print(msg);
+    return;
+  }
+
+  /* sensor read */
+  if (strcmp(cmd, "sensor") == 0)
+  {
+    if (strcmp(arg1, "read") == 0)
+    {
+      float temp_c = sensor_read_celsius();
+      char msg[64];
+      snprintf(msg, sizeof(msg), "\r\nSensor value: %.1f C\r\n", temp_c);
+      uart_print(msg);
+    }
+    else
+    {
+      uart_print("\r\nUsage: sensor read\r\n");
+    }
+    return;
+  }
+
+  /* log start / l */
+  if (strcmp(cmd, "l") == 0 || (strcmp(cmd, "log") == 0 && strcmp(arg1, "start") == 0))
+  {
+    logging_enabled = 1;
+    uart_print("\r\nLogging started\r\n");
+    return;
+  }
+
+  /* log stop / x */
+  if (strcmp(cmd, "x") == 0 || (strcmp(cmd, "log") == 0 && strcmp(arg1, "stop") == 0))
+  {
+    logging_enabled = 0;
+    uart_print("\r\nLogging stopped\r\n");
+    return;
+  }
+
+  /* If we reach here, command not recognized */
+  uart_print("\r\nUnknown command. Type 'help' for a list of commands.\r\n");
+}
+
+/**
   * @brief LED task
   * @note  Blinks LD2 every 500 ms as a heartbeat.
   */
@@ -504,7 +713,7 @@ void LEDTask(void *argument)
 
 /**
   * @brief Sensor task
-  * @note  Periodically reads the virtual sensor and logs over UART.
+  * @note  Periodically reads the virtual sensor and enqueues log messages.
   */
 void SensorTask(void *argument)
 {
@@ -515,37 +724,97 @@ void SensorTask(void *argument)
   for (;;)
   {
     float temp = sensor_read_celsius();
-    char msg[64];
-    snprintf(msg, sizeof(msg), "RTOS LOG: %.1f C\r\n", temp);
-    uart_print(msg);
+
+    LogMessage_t logMsg;
+    snprintf(logMsg.text, sizeof(logMsg.text), "RTOS LOG: %.1f C\r\n", temp);
+
+    /* Non-blocking log enqueue; if queue is full, drop the log */
+    (void)osMessageQueuePut(logQueueHandle, &logMsg, 0, 0);
+
     osDelay(1000);                          /* 1 s */
   }
 }
 
 /**
   * @brief CLI task
-  * @note  Waits for characters from the CLI queue, echoes them,
-  *        and dispatches commands to handle_command().
+  * @note  Owns the UART for both logs and CLI output.
+  *        - Drains logQueue and prints log messages.
+  *        - Handles interactive CLI with line editing and prompt.
   */
 void CLITask(void *argument)
 {
   (void)argument;
 
   uint8_t c;
+  char line_buf[64];
+  uint16_t line_len = 0;
 
-  uart_print("\r\nCLI Ready\r\n");
+  LogMessage_t logMsg;
+
+  uart_print("\r\nCLI Ready\r\n> ");
 
   for (;;)
   {
-    /* Wait indefinitely for next character from ISR → queue */
-    if (osMessageQueueGet(cliQueueHandle, &c, NULL, osWaitForever) == osOK)
+    /* ----------------------------------------------------------------------
+     * 1) Drain any pending log messages first (non-blocking)
+     * -------------------------------------------------------------------- */
+    while (osMessageQueueGet(logQueueHandle, &logMsg, NULL, 0) == osOK)
     {
-      /* Echo back */
-      uart_write_char(c);
+      /* Move to a fresh line, print the log, then redraw the prompt + input */
+      uart_print("\r\n");
+      uart_print(logMsg.text);
 
-      /* Process as a command */
-      handle_command(c);
+      uart_print("> ");
+      if (line_len > 0)
+      {
+        /* Re-print whatever the user has typed so far */
+        uart_print(line_buf);
+      }
     }
+
+    /* ----------------------------------------------------------------------
+     * 2) Wait for next CLI character with a short timeout
+     *    This lets us regularly check the log queue too.
+     * -------------------------------------------------------------------- */
+    if (osMessageQueueGet(cliQueueHandle, &c, NULL, 50) == osOK)
+    {
+      /* Handle newline (Enter) */
+      if (c == '\r' || c == '\n')
+      {
+        uart_print("\r\n");
+
+        if (line_len > 0)
+        {
+          line_buf[line_len] = '\0';   /* null-terminate */
+          handle_command_line(line_buf);
+          line_len = 0;
+        }
+
+        uart_print("> ");
+        continue;
+      }
+
+      /* Handle backspace (ASCII 8 or 127) */
+      if (c == 0x08 || c == 0x7F)
+      {
+        if (line_len > 0)
+        {
+          line_len--;
+          /* Erase character on terminal: backspace, space, backspace */
+          uart_print("\b \b");
+        }
+        continue;
+      }
+
+      /* Printable characters only, with bounds check */
+      if (line_len < (sizeof(line_buf) - 1) && c >= 32 && c < 127)
+      {
+        line_buf[line_len++] = (char)c;
+        uart_write_char(c);  /* echo */
+      }
+      /* else: ignore (buffer full or non-printable) */
+    }
+    /* else: timeout, loop again, process logs if any */
   }
 }
 /* USER CODE END 4 */
