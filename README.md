@@ -212,6 +212,7 @@ LOG: 23.3 C
 | **v1.6.0** | Multi-word CLI |
 | **v1.7.0** | Log queue (decoupled logging) |
 | **v1.8.0** | Added `clear` command |
+| **v1.8.1** | Remove SensorTask logging |
 
 Next planned:
 
